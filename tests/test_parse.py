@@ -47,10 +47,14 @@ SCAN = """BSS 04:42:1a:00:11:24(on wlan0) -- associated
 	freq: 5180.0
 	signal: -63.00 dBm
 	SSID: HomeNet
-BSS 04:42:1a:00:11:20(on wlan0)
+BSS 06:42:1a:00:11:20(on wlan0)
 	freq: 2437.0
 	signal: -51.00 dBm
-	SSID: HomeNet
+	SSID: HomeNet-2.4G
+BSS 04:42:1a:00:11:2c(on wlan0)
+	freq: 5500.0
+	signal: -70.00 dBm
+	SSID:
 BSS aa:bb:cc:dd:ee:01(on wlan0)
 	freq: 5180.0
 	signal: -80.00 dBm
@@ -90,9 +94,11 @@ class Parse(unittest.TestCase):
 
     def test_scan(self):
         aps = ww.parse_scan(SCAN)
-        self.assertEqual(len(aps), 4)
-        self.assertEqual(aps[1], {"bssid": "04:42:1a:00:11:20", "ssid": "HomeNet", "freq": 2437.0, "signal": -51})
-        self.assertEqual(aps[3]["ssid"], "")
+        self.assertEqual(len(aps), 5)
+        self.assertEqual(aps[1], {"bssid": "06:42:1a:00:11:20", "ssid": "HomeNet-2.4G", "freq": 2437.0, "signal": -51})
+        self.assertEqual(aps[4]["ssid"], "")
+        self.assertTrue(ww.same_radio_family("c2:ad:9f:7d:61:c1", "6a:ad:9f:7d:61:c5"))
+        self.assertFalse(ww.same_radio_family("4c:c4:49:19:ff:bd", "6a:ad:9f:7d:61:c5"))
 
     def test_ping(self):
         sent, recv, rtts = ww.parse_ping(PING)

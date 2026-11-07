@@ -163,23 +163,35 @@ def pct(values, p):
     return v[k]
 
 
+def same_radio_family(a, b):
+    """Routers derive every BSSID (each band, guest/hidden networks) from one base MAC: the first
+    byte often gets the locally-administered bit and the last nibble varies, the middle stays."""
+    pa, pb = a.lower().split(":"), b.lower().split(":")
+    return len(pa) == len(pb) == 6 and pa[1:5] == pb[1:5] and pa[5][0] == pb[5][0]
+
+
+def own_router(ap, own_ssid, own_bssid):
+    return bool((own_ssid and ap["ssid"] == own_ssid) or (own_bssid and same_radio_family(ap["bssid"], own_bssid)))
+
+
 def summarize_spot(samples, ping, scan, own_ssid, noise):
     """Turn raw samples of one spot into the record we store."""
     sig = [s["signal"] for s in samples if s and "signal" in s]
     rate = [s["tx_rate"] for s in samples if s and "tx_rate" in s]
     sent, recv, rtts = ping
-    bands = {}
-    for ap in scan:
-        if own_ssid and ap["ssid"] == own_ssid:
-            b = band(ap["freq"])
-            if b not in bands or ap["signal"] > bands[b]["signal"]:
-                bands[b] = {"signal": ap["signal"], "bssid": ap["bssid"], "channel": channel(ap["freq"])}
     connected = [s for s in samples if s]
     cur = connected[-1] if connected else {}
+    mine = [ap for ap in scan if own_router(ap, own_ssid, cur.get("bssid"))]
+    bands = {}
+    for ap in mine:
+        b = band(ap["freq"])
+        if b not in bands or ap["signal"] > bands[b]["signal"]:
+            bands[b] = {"signal": ap["signal"], "bssid": ap["bssid"], "ssid": ap["ssid"],
+                        "channel": channel(ap["freq"])}
     neighbours = 0
     if cur.get("freq"):
         ch = channel(cur["freq"])
-        neighbours = sum(1 for ap in scan if channel(ap["freq"]) == ch and ap["ssid"] != own_ssid)
+        neighbours = sum(1 for ap in scan if channel(ap["freq"]) == ch and ap not in mine)
     med = round(statistics.median(sig)) if sig else None
     return {
         "signal_median": med,
@@ -599,8 +611,8 @@ def hints(spots):
     print(f"\n  Weakest spot: {worst['spot']} at {fmt(worst['signal_median'], ' dBm')} ({worst['verdict']}).")
     rb = worst.get("router_bands", {})
     if "5" in rb and "2.4" in rb and rb["5"]["signal"] < -72 <= rb["2.4"]["signal"]:
-        print("  5 GHz barely reaches it but 2.4 GHz does: devices there flip between bands."
-              " Moving the router toward it, or a mesh node, fixes that properly.")
+        print(f"  5 GHz barely reaches it ({rb['5']['signal']} dBm) but 2.4 GHz does ({rb['2.4']['signal']} dBm):"
+              " 2.4 GHz is slower but steadier there. Moving the router toward it, or a mesh node, fixes it properly.")
     lossy = [r["spot"] for r in spots if (r["ping_loss_pct"] or 0) >= 2]
     if lossy:
         print(f"  Packet loss >= 2% at: {', '.join(lossy)} (that's what feels like 'disconnecting').")
