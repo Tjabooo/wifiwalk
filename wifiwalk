@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""wifiwalk: measure Wi-Fi coverage room by room and find where the router should go.
+
+  wifiwalk walk  [--name LABEL] [--seconds N]   survey: carry the laptop from spot to spot
+  wifiwalk watch [--interval S]                 park the laptop in a problem room, log dropouts
+  wifiwalk router [--once] [--interval S]       poll an ASUS router's client list (RSSI per device)
+  wifiwalk report FILE [FILE...]                summarise a survey, or compare surveys side by side
+
+Linux only. Needs `iw` and `ping`; `nmcli` is used to trigger a fresh scan when present.
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import ssl
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "wifiwalk"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "wifiwalk/config.toml"
+
+# Signal thresholds (dBm) and what they mean in practice.
+LEVELS = [
+    (-60, "great", "anything works"),
+    (-67, "good", "video calls and streaming are fine"),
+    (-72, "fair", "browsing ok, calls may stutter"),
+    (-78, "weak", "slow, drops likely"),
+    (-999, "bad", "expect disconnects"),
+]
+
+
+def verdict(dbm):
+    if dbm is None:
+        return "none"
+    for floor, name, _ in LEVELS:
+        if dbm >= floor:
+            return name
+    return "bad"
+
+
+def band(freq):
+    if freq is None:
+        return "?"
+    if freq < 3000:
+        return "2.4"
+    if freq < 5925:
+        return "5"
+    return "6"
+
+
+def channel(freq):
+    if freq is None:
+        return None
+    f = int(round(freq))
+    if f == 2484:
+        return 14
+    if f < 3000:
+        return (f - 2407) // 5
+    if f < 5925:
+        return (f - 5000) // 5
+    return (f - 5950) // 5
+
+
+# ---------------------------------------------------------------- parsing (pure, tested)
+
+def parse_link(text):
+    """`iw dev IF link` -> dict, or None when not connected."""
+    m = re.search(r"Connected to ([0-9a-f:]{17})", text)
+    if not m:
+        return None
+    out = {"bssid": m.group(1)}
+    for key, pat in [
+        ("ssid", r"^\s*SSID: (.*)$"),
+        ("freq", r"^\s*freq: ([\d.]+)"),
+        ("signal", r"^\s*signal: (-?\d+) dBm"),
+        ("rx_rate", r"^\s*rx bitrate: ([\d.]+) MBit/s"),
+        ("tx_rate", r"^\s*tx bitrate: ([\d.]+) MBit/s"),
+    ]:
+        mm = re.search(pat, text, re.M)
+        if mm:
+            v = mm.group(1)
+            out[key] = v if key == "ssid" else float(v)
+    if "signal" in out:
+        out["signal"] = int(out["signal"])
+    w = re.search(r"tx bitrate: .*?(\d+)MHz", text)
+    if w:
+        out["width"] = int(w.group(1))
+    return out
+
+
+def parse_station(text):
+    """`iw dev IF station dump` -> counters for the AP we're associated with."""
+    out = {}
+    for key, pat in [
+        ("tx_retries", r"tx retries:\s*(\d+)"),
+        ("tx_failed", r"tx failed:\s*(\d+)"),
+        ("beacon_loss", r"beacon loss:\s*(\d+)"),
+        ("tx_packets", r"tx packets:\s*(\d+)"),
+    ]:
+        m = re.search(pat, text)
+        if m:
+            out[key] = int(m.group(1))
+    return out
+
+
+def parse_noise(text):
+    """`iw dev IF survey dump` -> noise floor (dBm) of the channel in use."""
+    for block in re.split(r"(?=Survey data from)", text):
+        if "[in use]" in block:
+            m = re.search(r"noise:\s*(-?\d+) dBm", block)
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def parse_scan(text):
+    """`iw dev IF scan dump` -> list of {bssid, freq, signal, ssid}."""
+    out = []
+    for block in re.split(r"(?m)^(?=BSS [0-9a-f:]{17})", text):
+        m = re.match(r"BSS ([0-9a-f:]{17})", block)
+        if not m:
+            continue
+        ap = {"bssid": m.group(1), "ssid": ""}
+        f = re.search(r"^\s*freq: ([\d.]+)", block, re.M)
+        s = re.search(r"^\s*signal: (-?[\d.]+) dBm", block, re.M)
+        n = re.search(r"^\s*SSID: (.*)$", block, re.M)
+        if f:
+            ap["freq"] = float(f.group(1))
+        if s:
+            ap["signal"] = round(float(s.group(1)))
+        if n:
+            ap["ssid"] = n.group(1).strip()
+        if "freq" in ap and "signal" in ap:
+            out.append(ap)
+    return out
+
+
+def parse_ping(text):
+    """ping output -> (sent, received, [rtt ms...])."""
+    rtts = [float(x) for x in re.findall(r"time=([\d.]+) ms", text)]
+    m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", text)
+    if m:
+        return int(m.group(1)), int(m.group(2)), rtts
+    return len(rtts), len(rtts), rtts
+
+
+def pct(values, p):
+    if not values:
+        return None
+    v = sorted(values)
+    k = min(len(v) - 1, max(0, round(p / 100 * (len(v) - 1))))
+    return v[k]
+
+
+def summarize_spot(samples, ping, scan, own_ssid, noise):
+    """Turn raw samples of one spot into the record we store."""
+    sig = [s["signal"] for s in samples if s and "signal" in s]
+    rate = [s["tx_rate"] for s in samples if s and "tx_rate" in s]
+    sent, recv, rtts = ping
+    bands = {}
+    for ap in scan:
+        if own_ssid and ap["ssid"] == own_ssid:
+            b = band(ap["freq"])
+            if b not in bands or ap["signal"] > bands[b]["signal"]:
+                bands[b] = {"signal": ap["signal"], "bssid": ap["bssid"], "channel": channel(ap["freq"])}
+    connected = [s for s in samples if s]
+    cur = connected[-1] if connected else {}
+    neighbours = 0
+    if cur.get("freq"):
+        ch = channel(cur["freq"])
+        neighbours = sum(1 for ap in scan if channel(ap["freq"]) == ch and ap["ssid"] != own_ssid)
+    med = round(statistics.median(sig)) if sig else None
+    return {
+        "signal_median": med,
+        "signal_min": min(sig) if sig else None,
+        "signal_max": max(sig) if sig else None,
+        "noise": noise,
+        "snr": (med - noise) if (med is not None and noise is not None) else None,
+        "tx_rate_median": round(statistics.median(rate)) if rate else None,
+        "band": band(cur.get("freq")),
+        "channel": channel(cur.get("freq")),
+        "width": cur.get("width"),
+        "bssid": cur.get("bssid"),
+        "disconnected_samples": len(samples) - len(connected),
+        "ping_sent": sent,
+        "ping_lost": sent - recv,
+        "ping_loss_pct": round(100 * (sent - recv) / sent, 1) if sent else None,
+        "ping_p50": pct(rtts, 50),
+        "ping_p95": pct(rtts, 95),
+        "ping_max": max(rtts) if rtts else None,
+        "router_bands": bands,
+        "same_channel_neighbours": neighbours,
+        "verdict": verdict(med),
+    }
+
+
+# ---------------------------------------------------------------- system access
+
+def run(cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def wifi_iface(wanted=None):
+    if wanted:
+        return wanted
+    m = re.findall(r"Interface (\S+)\n(?:\s+.*\n)*?\s+type managed", run(["iw", "dev"]) + "\n")
+    if m:
+        return m[0]
+    for p in Path("/sys/class/net").iterdir():
+        if (p / "wireless").exists():
+            return p.name
+    sys.exit("wifiwalk: no Wi-Fi interface found (is this the laptop?)")
+
+
+def gateway(iface):
+    m = re.search(r"default via (\S+)", run(["ip", "route", "show", "default", "dev", iface]))
+    if not m:
+        m = re.search(r"default via (\S+)", run(["ip", "route", "show", "default"]))
+    return m.group(1) if m else None
+
+
+def read_link(iface):
+    return parse_link(run(["iw", "dev", iface, "link"], timeout=5))
+
+
+def fresh_scan(iface):
+    if shutil.which("nmcli"):
+        run(["nmcli", "device", "wifi", "rescan", "ifname", iface], timeout=15)
+        time.sleep(4)
+    return parse_scan(run(["iw", "dev", iface, "scan", "dump"], timeout=10))
+
+
+def need(*tools):
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        sys.exit(f"wifiwalk: missing {', '.join(missing)} (pacman -S iw iputils)")
+
+
+def append(path, rec):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------- walk
+
+def cmd_walk(a):
+    need("iw", "ping")
+    iface = wifi_iface(a.iface)
+    gw = gateway(iface)
+    label = re.sub(r"[^\w.-]+", "-", a.name) if a.name else "survey"
+    path = Path(a.out) if a.out else STATE / f"{label}-{datetime.now():%Y%m%d-%H%M}.jsonl"
+    link = read_link(iface)
+    if not link:
+        sys.exit(f"wifiwalk: {iface} isn't connected")
+    own = link.get("ssid")
+    append(path, {"kind": "survey", "time": now(), "name": a.name or "", "iface": iface,
+                  "ssid": own, "gateway": gw, "seconds": a.seconds})
+    print(f"Survey '{a.name or label}' on {iface} ({own}), gateway {gw}. Saving to {path}")
+    print("Stand where people actually use their devices, hold the laptop at table height.")
+    print("Type a spot name and press Enter to measure it; empty line finishes.\n")
+    done = 0
+    while True:
+        try:
+            spot = input("spot> ").strip()
+        except EOFError:
+            print()
+            break
+        if not spot:
+            break
+        rec = measure_spot(iface, gw, own, a.seconds)
+        rec.update({"kind": "spot", "spot": spot, "time": now()})
+        append(path, rec)
+        done += 1
+        print("\r" + " " * 70 + "\r" + spot_line(spot, rec))
+    if done:
+        print()
+        report([path])
+    else:
+        path.unlink(missing_ok=True)
+
+
+def measure_spot(iface, gw, own, seconds):
+    count = max(5, int(seconds * 5))
+    ping_out = {}
+
+    def pinger():
+        if gw:
+            ping_out["text"] = run(["ping", "-n", "-i", "0.2", "-W", "1", "-c", str(count), gw],
+                                   timeout=seconds + 10)
+
+    t = threading.Thread(target=pinger)
+    t.start()
+    samples = []
+    st0 = parse_station(run(["iw", "dev", iface, "station", "dump"]))
+    end = time.time() + seconds
+    while time.time() < end:
+        s = read_link(iface)
+        samples.append(s)
+        sig = s.get("signal") if s else None
+        bar = "#" * max(0, min(40, (sig + 95) if sig else 0))
+        print(f"\r  {sig if sig else '--'} dBm {bar:<40} {int(end - time.time()):>3}s", end="", flush=True)
+        time.sleep(1)
+    t.join()
+    st1 = parse_station(run(["iw", "dev", iface, "station", "dump"]))
+    noise = parse_noise(run(["iw", "dev", iface, "survey", "dump"]))
+    print("\r  scanning…" + " " * 60, end="", flush=True)
+    scan = fresh_scan(iface)
+    rec = summarize_spot(samples, parse_ping(ping_out.get("text", "")), scan, own, noise)
+    sent = st1.get("tx_packets", 0) - st0.get("tx_packets", 0)
+    retries = st1.get("tx_retries", 0) - st0.get("tx_retries", 0)
+    rec["tx_retry_pct"] = round(100 * retries / sent, 1) if sent > 0 else None
+    rec["beacon_loss"] = st1.get("beacon_loss", 0) - st0.get("beacon_loss", 0)
+    return rec
+
+
+def spot_line(spot, r):
+    bands = "  ".join(f"{b}G {v['signal']}" for b, v in sorted(r["router_bands"].items()))
+    return (f"  {spot:<18} {fmt(r['signal_median'], ' dBm'):>8}  {r['verdict']:<5}  on {r['band']} GHz"
+            f"  {fmt(r['tx_rate_median'], ' Mb/s'):>10}  loss {fmt(r['ping_loss_pct'], '%')}"
+            f"  p95 {fmt(r['ping_p95'], ' ms')}" + (f"   [router: {bands}]" if bands else ""))
+
+
+def fmt(v, unit=""):
+    if v is None:
+        return "-"
+    if isinstance(v, float):
+        v = round(v) if abs(v) >= 10 else round(v, 1)
+    return f"{v}{unit}"
+
+
+# ---------------------------------------------------------------- watch
+
+def cmd_watch(a):
+    need("iw", "ping")
+    iface = wifi_iface(a.iface)
+    gw = gateway(iface)
+    path = Path(a.out) if a.out else STATE / f"watch-{datetime.now():%Y%m%d-%H%M}.jsonl"
+    append(path, {"kind": "watch", "time": now(), "iface": iface, "gateway": gw, "interval": a.interval})
+    print(f"Watching {iface}, gateway {gw}, every {a.interval}s. Log: {path}  (Ctrl-C stops)")
+    prev, fails = None, 0
+    try:
+        while True:
+            t0 = time.time()
+            link = read_link(iface)
+            g = gw or gateway(iface)
+            sent, recv, rtts = parse_ping(run(["ping", "-n", "-c", "1", "-W", "1", g], 3)) if g else (1, 0, [])
+            rec = {"kind": "tick", "time": now(), "connected": bool(link),
+                   "signal": link.get("signal") if link else None,
+                   "band": band(link.get("freq")) if link else None,
+                   "bssid": link.get("bssid") if link else None,
+                   "tx_rate": link.get("tx_rate") if link else None,
+                   "ping": rtts[0] if recv else None}
+            append(path, rec)
+            events = []
+            if prev is not None:
+                if prev["connected"] and not rec["connected"]:
+                    events.append("DISCONNECTED")
+                elif not prev["connected"] and rec["connected"]:
+                    events.append(f"reconnected ({rec['band']} GHz, {rec['signal']} dBm)")
+                elif rec["connected"] and prev["bssid"] != rec["bssid"]:
+                    events.append(f"switched to {rec['band']} GHz / {rec['bssid']} ({rec['signal']} dBm)")
+            fails = fails + 1 if rec["ping"] is None else 0
+            if fails == 3:
+                events.append("no internet path to router (3 pings lost)")
+            for e in events:
+                append(path, {"kind": "event", "time": rec["time"], "event": e, "signal": rec["signal"]})
+                print(f"\n{rec['time'][11:19]}  ** {e}")
+            print(f"\r{rec['time'][11:19]}  {fmt(rec['signal'], ' dBm'):>8}  {rec['band'] or '-'} GHz"
+                  f"  {fmt(rec['tx_rate'], ' Mb/s'):>10}  ping {fmt(rec['ping'], ' ms'):>7}   ",
+                  end="", flush=True)
+            prev = rec
+            time.sleep(max(0, a.interval - (time.time() - t0)))
+    except KeyboardInterrupt:
+        print()
+        report([path])
+
+
+# ---------------------------------------------------------------- router (ASUSWRT app API)
+
+ASUS_UA = "asusrouter-Android-DUTUtil-1.0.0.245"
+ASUS_BANDS = {"1": "2.4", "2": "5", "3": "5-2", "4": "6", "5": "6-2"}
+
+
+class Asus:
+    def __init__(self, url, user, password, verify=False):
+        self.url, self.user, self.password = url.rstrip("/"), user, password
+        self.ctx = None if verify else ssl._create_unverified_context()
+        self.token = None
+
+    def _req(self, path, data=None):
+        headers = {"User-Agent": ASUS_UA}
+        if self.token:
+            headers["Cookie"] = f"asus_token={self.token}"
+        body = urllib.parse.urlencode(data).encode() if data is not None else None
+        req = urllib.request.Request(self.url + path, data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=10, context=self.ctx) as r:
+            return r.read().decode("utf-8", "replace")
+
+    def login(self):
+        auth = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
+        text = self._req("/login.cgi", {"login_authorization": auth})
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            raise SystemExit(f"wifiwalk: unexpected login reply from {self.url}")
+        if "asus_token" not in data:
+            hint = {"3": "wrong username or password", "7": "locked after failed logins, wait 5 min",
+                    "10": "router wants a captcha, log in once in the browser"}.get(str(data.get("error_status")), "")
+            raise SystemExit(f"wifiwalk: router login failed: {data} {hint}")
+        self.token = data["asus_token"]
+
+    def clients(self):
+        for attempt in (1, 2):
+            if not self.token:
+                self.login()
+            text = self._req("/appGet.cgi", {"hook": "get_clientlist();"})
+            try:
+                return parse_clientlist(json.loads(text))
+            except (json.JSONDecodeError, KeyError):
+                self.token = None   # session expired: log in again once
+        raise SystemExit("wifiwalk: router didn't return a client list")
+
+    def logout(self):
+        if self.token:
+            try:
+                self._req("/Logout.asp")
+            except (urllib.error.URLError, OSError):
+                pass
+
+
+def parse_clientlist(data):
+    """appGet get_clientlist() JSON -> list of wireless clients that are online."""
+    cl = data["get_clientlist"]
+    out = []
+    for mac in cl.get("maclist", []):
+        c = cl.get(mac, {})
+        wl = str(c.get("isWL", "0"))
+        if wl == "0" or str(c.get("isOnline", "1")) != "1":
+            continue
+        try:
+            rssi = int(c.get("rssi"))
+        except (TypeError, ValueError):
+            rssi = None
+        out.append({"mac": mac, "name": c.get("nickName") or c.get("name") or mac,
+                    "ip": c.get("ip", ""), "band": ASUS_BANDS.get(wl, wl), "rssi": rssi,
+                    "tx": c.get("curTx", ""), "rx": c.get("curRx", ""),
+                    "connected_for": c.get("wlConnectTime", "")})
+    return sorted(out, key=lambda c: c["rssi"] if c["rssi"] is not None else 0)
+
+
+def load_router_config(a):
+    cfg = {}
+    if CONFIG.exists():
+        cfg = tomllib.loads(CONFIG.read_text()).get("router", {})
+    url = a.url or cfg.get("url")
+    if not url:
+        m = re.search(r"default via (\S+)", run(["ip", "route", "show", "default"]))
+        if not m:
+            sys.exit("wifiwalk: no default gateway; pass --url")
+        url = f"http://{m.group(1)}"
+    user = a.user or cfg.get("username", "admin")
+    pw = os.environ.get("WIFIWALK_ROUTER_PASSWORD")
+    if not pw and cfg.get("password_file"):
+        pw = Path(os.path.expanduser(cfg["password_file"])).read_text().strip()
+    if not pw:
+        sys.exit(f"wifiwalk: no router password. Set WIFIWALK_ROUTER_PASSWORD or password_file in {CONFIG}")
+    return Asus(url, user, pw, cfg.get("verify_tls", False))
+
+
+def cmd_router(a):
+    r = load_router_config(a)
+    try:
+        if a.once:
+            clients = r.clients()
+            print(f"{'device':<28} {'band':>5} {'RSSI':>6}  {'':<5} {'tx/rx Mb/s':>12}  connected")
+            for c in clients:
+                print(f"{c['name'][:28]:<28} {c['band']:>5} {fmt(c['rssi']):>6}  {verdict(c['rssi']):<5}"
+                      f" {c['tx'] + '/' + c['rx']:>12}  {c['connected_for']}")
+            return
+        path = Path(a.out) if a.out else STATE / f"router-{datetime.now():%Y%m%d-%H%M}.jsonl"
+        print(f"Polling {r.url} every {a.interval}s. Log: {path}  (Ctrl-C stops)")
+        seen = {}
+        while True:
+            cl = {c["mac"]: c for c in r.clients()}
+            t = now()
+            append(path, {"kind": "clients", "time": t, "clients": list(cl.values())})
+            for mac, c in cl.items():
+                old = seen.get(mac)
+                if old is None and seen:
+                    ev = f"{c['name']} joined on {c['band']} GHz ({c['rssi']} dBm)"
+                elif old and old["band"] != c["band"]:
+                    ev = f"{c['name']} moved {old['band']} -> {c['band']} GHz ({c['rssi']} dBm)"
+                else:
+                    continue
+                append(path, {"kind": "event", "time": t, "event": ev, "mac": mac})
+                print(f"{t[11:19]}  {ev}")
+            for mac, old in seen.items():
+                if mac not in cl:
+                    ev = f"{old['name']} dropped (last {old['rssi']} dBm on {old['band']} GHz)"
+                    append(path, {"kind": "event", "time": t, "event": ev, "mac": mac})
+                    print(f"{t[11:19]}  {ev}")
+            seen = cl
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        r.logout()
+
+
+# ---------------------------------------------------------------- report
+
+def load(path):
+    recs = []
+    for line in Path(path).read_text().splitlines():
+        try:
+            recs.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return recs
+
+
+def report(paths):
+    files = [(Path(p), load(p)) for p in paths]
+    kinds = {r.get("kind") for _, recs in files for r in recs}
+    if "spot" in kinds:
+        report_spots(files)
+    if "tick" in kinds or "clients" in kinds:
+        for p, recs in files:
+            report_log(p, recs)
+
+
+def report_spots(files):
+    if len(files) == 1:
+        p, recs = files[0]
+        head = next((r for r in recs if r.get("kind") == "survey"), {})
+        print(f"Survey {head.get('name') or p.stem}  ({head.get('time', '')[:16]}, {head.get('ssid', '')})")
+        spots = [r for r in recs if r.get("kind") == "spot"]
+        print(f"  {'spot':<18} {'signal':>8}  {'':<5}  {'band':<9}  {'rate':>10}  {'loss':>4}  {'p95':>5}"
+              f"  {'SNR':>4}  {'retry':>5}  router bands seen")
+        for r in spots:
+            bands = "  ".join(f"{b}G {v['signal']}" for b, v in sorted(r["router_bands"].items()))
+            print(f"  {r['spot'][:18]:<18} {fmt(r['signal_median'], ' dBm'):>8}  {r['verdict']:<5}"
+                  f"  {r['band'] + ' GHz ch' + str(r['channel'] or '-'):<9}  {fmt(r['tx_rate_median'], ' Mb/s'):>10}"
+                  f"  {fmt(r['ping_loss_pct'], '%'):>4}  {fmt(r['ping_p95'], 'ms'):>5}  {fmt(r['snr']):>4}"
+                  f"  {fmt(r.get('tx_retry_pct'), '%'):>5}  {bands}")
+        hints(spots)
+        return
+    # compare several surveys (e.g. one per router position)
+    names, cols = [], []
+    for p, recs in files:
+        head = next((r for r in recs if r.get("kind") == "survey"), {})
+        names.append((head.get("name") or p.stem)[:14])
+        cols.append({r["spot"]: r for r in recs if r.get("kind") == "spot"})
+    spots = list(dict.fromkeys(s for c in cols for s in c))
+    print(f"  {'spot':<18}" + "".join(f"{n:>16}" for n in names))
+    for s in spots:
+        cells = []
+        for c in cols:
+            r = c.get(s)
+            cells.append(f"{r['signal_median']} {r['verdict']}" if r and r["signal_median"] is not None else "-")
+        print(f"  {s[:18]:<18}" + "".join(f"{x:>16}" for x in cells))
+    totals = []
+    for n, c in zip(names, cols):
+        sig = [r["signal_median"] for r in c.values() if r["signal_median"] is not None]
+        if sig:
+            totals.append((min(sig), statistics.median(sig), n))
+    if totals:
+        best = max(totals)
+        print(f"\n  Best placement: {best[2]} (weakest spot {best[0]} dBm, median {round(best[1])} dBm)."
+              "\n  Ranked by the weakest spot: coverage is only as good as the worst room.")
+
+
+def hints(spots):
+    if not spots:
+        return
+    worst = min(spots, key=lambda r: r["signal_median"] if r["signal_median"] is not None else -999)
+    print()
+    for floor, name, meaning in LEVELS:
+        print(f"    {name:<5} {'>= ' + str(floor) if floor > -999 else '<  -78':>6} dBm  {meaning}")
+    print(f"\n  Weakest spot: {worst['spot']} at {fmt(worst['signal_median'], ' dBm')} ({worst['verdict']}).")
+    rb = worst.get("router_bands", {})
+    if "5" in rb and "2.4" in rb and rb["5"]["signal"] < -72 <= rb["2.4"]["signal"]:
+        print("  5 GHz barely reaches it but 2.4 GHz does: devices there flip between bands."
+              " Moving the router toward it, or a mesh node, fixes that properly.")
+    lossy = [r["spot"] for r in spots if (r["ping_loss_pct"] or 0) >= 2]
+    if lossy:
+        print(f"  Packet loss >= 2% at: {', '.join(lossy)} (that's what feels like 'disconnecting').")
+    crowded = [r["spot"] for r in spots if r.get("same_channel_neighbours", 0) >= 4]
+    if crowded:
+        print(f"  Crowded channel (4+ neighbour networks on it) at: {', '.join(crowded)}.")
+
+
+def report_log(p, recs):
+    ticks = [r for r in recs if r.get("kind") == "tick"]
+    events = [r for r in recs if r.get("kind") == "event"]
+    if ticks:
+        sig = [t["signal"] for t in ticks if t["signal"] is not None]
+        down = sum(1 for t in ticks if not t["connected"])
+        lost = sum(1 for t in ticks if t["ping"] is None)
+        span = f"{ticks[0]['time'][:16]} -> {ticks[-1]['time'][11:16]}"
+        print(f"Watch {p.name}: {span}, {len(ticks)} samples")
+        if sig:
+            print(f"  signal median {round(statistics.median(sig))} dBm, worst {min(sig)}, best {max(sig)}")
+        print(f"  not connected {down} samples, ping lost {lost} ({round(100 * lost / len(ticks), 1)}%)")
+    clients = [r for r in recs if r.get("kind") == "clients"]
+    if clients:
+        per = {}
+        for snap in clients:
+            for c in snap["clients"]:
+                if c["rssi"] is not None:
+                    per.setdefault(c["mac"], (c["name"], []))[1].append(c["rssi"])
+        print(f"Router log {p.name}: {clients[0]['time'][:16]} -> {clients[-1]['time'][11:16]}")
+        drops = {}
+        for e in events:
+            if "dropped" in e["event"]:
+                drops[e.get("mac")] = drops.get(e.get("mac"), 0) + 1
+        for mac, (name, vals) in sorted(per.items(), key=lambda kv: statistics.median(kv[1][1])):
+            print(f"  {name[:28]:<28} median {round(statistics.median(vals)):>4} dBm  worst {min(vals):>4}"
+                  f"  drops {drops.get(mac, 0)}")
+    if events:
+        print(f"  {len(events)} events:")
+        for e in events[-25:]:
+            print(f"    {e['time'][5:16].replace('T', ' ')}  {e['event']}")
+
+
+def cmd_report(a):
+    paths = a.files or sorted(STATE.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)[-1:]
+    if not paths:
+        sys.exit(f"wifiwalk: no logs in {STATE}")
+    report(paths)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="wifiwalk", description=__doc__.split("\n")[0])
+    ap.add_argument("-i", "--iface", help="Wi-Fi interface (default: first managed one)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    w = sub.add_parser("walk", help="measure spot by spot")
+    w.add_argument("--name", help="label for this survey, e.g. the router position")
+    w.add_argument("--seconds", type=int, default=15, help="seconds per spot (default 15)")
+    w.add_argument("--out")
+    w2 = sub.add_parser("watch", help="log signal and dropouts at one spot")
+    w2.add_argument("--interval", type=float, default=2)
+    w2.add_argument("--out")
+    r = sub.add_parser("router", help="poll an ASUS router's wireless clients")
+    r.add_argument("--once", action="store_true", help="print the current client table and exit")
+    r.add_argument("--interval", type=float, default=30)
+    r.add_argument("--url", help="router URL (default: config, else http://<gateway>)")
+    r.add_argument("--user")
+    r.add_argument("--out")
+    rp = sub.add_parser("report", help="summarise or compare logs (default: newest)")
+    rp.add_argument("files", nargs="*")
+    a = ap.parse_args()
+    {"walk": cmd_walk, "watch": cmd_watch, "router": cmd_router, "report": cmd_report}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

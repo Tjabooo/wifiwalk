@@ -1,0 +1,9 @@
+# Copy to ~/.config/wifiwalk/config.toml (only needed for `wifiwalk router`).
+[router]
+# Default: http://<your default gateway>. ASUS routers also serve HTTPS on 8443.
+url = "https://192.168.1.1:8443"
+username = "admin"
+# File holding only the router password (chmod 600). Or set WIFIWALK_ROUTER_PASSWORD instead.
+password_file = "~/.config/wifiwalk/router-password"
+# ASUS routers use a self-signed certificate.
+verify_tls = false
